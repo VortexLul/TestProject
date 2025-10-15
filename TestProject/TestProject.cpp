@@ -96,15 +96,31 @@ string ReplaceUnvalidName(const string& filename) {
     return replace;
 }
 
+string UniqueFileName(const filesystem::path& directory, const string& filename) {
+    filesystem::path basePath = directory / filename;
 
+    if (!filesystem::exists(basePath)) {
+        return basePath.string();
+    }
 
+    string stem = basePath.stem().string();
+    string extension = basePath.extension().string();
 
+    int counter = 1;
+    while (true) {
+        filesystem::path newPath = directory / (stem + " (" + to_string(counter) + ")" + extension);
+        if (!filesystem::exists(newPath)) {
+            return newPath.string();
+        }
+        counter++;
+    }
+}
 
 bool DowloadFunc(const string & url, string & folderPath) {
 
         CURL* curl;
         CURLcode res;
-        string response;
+        ResponseData response;
 
         curl = curl_easy_init();
         if (!curl) {
@@ -130,7 +146,7 @@ bool DowloadFunc(const string & url, string & folderPath) {
 
         long response_code;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
+        curl_easy_cleanup(curl);
 
         if (response_code != 200) {
             cerr << "Fail HTTP ќшибка HTTP ответа" << response_code << endl;
@@ -138,12 +154,24 @@ bool DowloadFunc(const string & url, string & folderPath) {
             return false;
         }
 
-        string filename = ExtractFileNameFromUrl(url);
+
+
+        string filename;
+
+        if (!response.contentDisposition.empty()) {
+            filename = ExtractFileName(response.contentDisposition);
+        }
+
+        if (filename.empty()) {
+            filename = ExtractFileNameFromUrl(url);
+        }
+
+        filename = ReplaceUnvalidName(filename);
 
         filesystem::path dirpath(folderPath);
-        filesystem::path fullPath = dirpath / filename;
-
         filesystem::create_directories(dirpath);
+
+        string fullPath = UniqueFileName(dirpath, filename);
 
         ofstream file(fullPath, ios::binary);
         if (!file.is_open()) {
@@ -151,9 +179,10 @@ bool DowloadFunc(const string & url, string & folderPath) {
             return false;
         }
 
-        file.write(response.c_str(), response.size());
+        file.write(response.content.c_str(), response.content.size());
         file.close();
-
+        cout << "Success Download ‘айл успешно скачан: " << fullPath << endl;
+        return true;
     }
 
     //if (curl) {
@@ -168,8 +197,6 @@ bool DowloadFunc(const string & url, string & folderPath) {
     // }
 int main() {
         curl_global_init(CURL_GLOBAL_DEFAULT);
-        CURL* curl = curl_easy_init();
-
         string url, folderPath;
 
         cout << "¬ведите URL файла:";
@@ -180,6 +207,7 @@ int main() {
 
         if (url.empty() || folderPath.empty()) {
             cerr << "ќшибка: URL и путь не могут быть пустыми" << endl;
+            curl_global_cleanup();
             return 1;
         }
 
