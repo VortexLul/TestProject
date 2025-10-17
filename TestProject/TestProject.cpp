@@ -8,10 +8,91 @@
 
 using namespace std;
 
+
+struct ResponseData {
+    string content;
+    string contentDisposition;
+    long responseCode;
+};
+
+
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, string* data) {
     size_t total_size = size * nmemb;
     data->append((char*)contents, total_size);
     return total_size;
+}
+
+size_t HeaderCallback(void* contents, size_t size, size_t nmemb, ResponseData* response ) {
+    size_t total_size = size * nmemb;
+    string header((char*)contents, total_size);
+    
+    if (header.find("Content-Disposition:") != string::npos) {
+        response->contentDisposition = header;
+    }
+    return total_size;
+}
+
+
+
+
+
+string ExtractFileName(const string& contentDisposition) {
+    if (contentDisposition.empty()) {
+        return "";
+    }
+
+    size_t filename_pos = contentDisposition.find("filename=");
+    if (filename_pos == string::npos) {
+        filename_pos = contentDisposition.find("filename =");
+    }
+    if (filename_pos == string::npos) {
+        filename_pos = contentDisposition.find("Filename=");
+    }
+    if (filename_pos == string::npos) {
+        return "";
+    }
+
+
+    filename_pos += 9;
+    while (filename_pos < contentDisposition.length() &&
+        (contentDisposition[filename_pos] == ' ' || contentDisposition[filename_pos] == '\t')) {
+        filename_pos++;
+    }
+
+    string filename;
+    
+    if (filename_pos < contentDisposition.length() &&
+        (contentDisposition[filename_pos] == '\"' || contentDisposition[filename_pos] == '\'')) {
+        filename_pos++;
+        size_t end_quote = contentDisposition.find(contentDisposition[filename_pos - 1], filename_pos);
+        if (end_quote != std::string::npos) {
+            filename = contentDisposition.substr(filename_pos, end_quote - filename_pos);
+        }
+    }
+    else {
+        size_t end_pos = contentDisposition.length();
+        for (size_t i = filename_pos; i < contentDisposition.length(); i++) {
+            if (contentDisposition[i] == ';' || contentDisposition[i] == '\r' ||
+                contentDisposition[i] == '\n' || contentDisposition[i] == ' ' ||
+                contentDisposition[i] == '\t') {
+                end_pos = i;
+                break;
+            }
+        }
+        if (end_pos > filename_pos) {
+            filename = contentDisposition.substr(filename_pos, end_pos - filename_pos);
+        }
+    }
+
+    if (!filename.empty()) {
+        size_t start = filename.find_first_not_of(" \t\r\n");
+        size_t end = filename.find_last_not_of(" \t\r\n");
+        if (start != string::npos && end != string::npos) {
+            filename = filename.substr(start, end - start + 1);
+        }
+    }
+    return filename;
+
 }
 
 string ExtractFileNameFromUrl(const string& url) {
@@ -19,6 +100,10 @@ string ExtractFileNameFromUrl(const string& url) {
     size_t question_mark = url.find('?');
     string clean_url = (question_mark != string::npos) ? url.substr(0, question_mark) : url;
 
+    size_t hash_mark = clean_url.find('#');
+    if (hash_mark != string::npos) {
+        clean_url = clean_url.substr(0, hash_mark);
+    }
 
     size_t last_slash = clean_url.find_last_of('/');
     if (last_slash != string::npos && last_slash + 1 < clean_url.length()) {
@@ -30,48 +115,6 @@ string ExtractFileNameFromUrl(const string& url) {
     }
 
     return "downloaded_file";
-}
-
-struct ResponseData {
-    string content;
-    string contentDisposition;
-    long responseCode;
-};
-
-
-string ExtractFileName(const string& contentDisposition) {
-    if (contentDisposition.empty()) {
-        return "";
-    }
-
-    size_t filename_pos = contentDisposition.find("filename=");
-    if (filename_pos == string::npos) {
-        return "";
-    }
-
-    filename_pos += 9;
-
-    if (contentDisposition[filename_pos] == '\"' || contentDisposition[filename_pos] == '\'') {
-        filename_pos++;
-        size_t end_quote = contentDisposition.find(contentDisposition[filename_pos - 1], filename_pos);
-        if (end_quote != string::npos) {
-            return contentDisposition.substr(filename_pos, end_quote - filename_pos);
-        }
-    }
-    else {
-        size_t end_pos = contentDisposition.find(';', filename_pos);
-        if (end_pos == string::npos) {
-            end_pos = contentDisposition.find('\r', filename_pos);
-        }
-        if (end_pos == string::npos) {
-            end_pos = contentDisposition.find('\n', filename_pos);
-        }
-        if (end_pos != string::npos) {
-            return contentDisposition.substr(filename_pos, end_pos - filename_pos);
-        }
-
-    }
-    return "";
 }
 
 
@@ -86,8 +129,15 @@ string ReplaceUnvalidName(const string& filename) {
     regex invalid_chars("[<>:\"/\\\\|?*]");
     replace = regex_replace(replace, invalid_chars, "_");
 
-    replace.erase(0, replace.find_last_not_of(" ."));
-    replace.erase(replace.find_first_not_of(" .") + 1);
+    size_t start = replace.find_first_not_of(" .");
+    size_t end = replace.find_last_not_of(" .");
+
+    if (start != string::npos && end != string::npos) {
+        replace = replace.substr(start, end - start + 1);
+    }
+    else {
+        replace = "downloaded_file";
+    }
 
     if (replace.empty()) {
         return "download_file";
