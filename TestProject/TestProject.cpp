@@ -4,7 +4,12 @@
 #include <filesystem>
 #include <curl/curl.h>
 #include <regex>
-
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <vector>
+#include <thread>
 
 using namespace std;
 
@@ -14,6 +19,20 @@ struct ResponseData {
     string contentDisposition;
     long responseCode;
 };
+
+struct DownloadTask {
+    string url;
+    string directoryPath;
+    int taskId;
+};
+
+queue<DownloadTask> taskQueue;
+mutex queueMutex;
+condition_variable condition;
+atomic<bool> stopThreads{ false };
+atomic<int> activeThreads{ 0 };
+atomic<int> completedTasks{ 0 };
+atomic<int> failedTasks{ 0 };
 
 
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, string* data) {
@@ -156,32 +175,46 @@ string UniqueFileName(const filesystem::path& directory, const string& filename)
     string stem = basePath.stem().string();
     string extension = basePath.extension().string();
 
-    int counter = 1;
-    while (true) {
-        filesystem::path newPath = directory / (stem + " (" + to_string(counter) + ")" + extension);
-        if (!filesystem::exists(newPath)) {
-            return newPath.string();
+    if (extension.empty()) {
+        int counter = 1;
+        while (true) {
+            filesystem::path newPath = directory / (stem + " (" + to_string(counter) + ")");
+            if (!filesystem::exists(newPath)) {
+                return newPath.string();
+            }
+            counter++;
         }
-        counter++;
+    }
+    else {
+        
+        int counter = 1;
+        while (true) {
+            filesystem::path newPath = directory / (stem + " (" + to_string(counter) + ")" + extension);
+            if (!filesystem::exists(newPath)) {
+                return newPath.string();
+            }
+            counter++;
+        }
     }
 }
 
-bool DowloadFunc(const string & url, string & folderPath) {
-
+bool DowloadFunc(const string & url, string & folderPath, int taskId) {
         CURL* curl;
         CURLcode res;
         ResponseData response;
 
         curl = curl_easy_init();
         if (!curl) {
-            cerr << "Fail init Ошибка инициализации" << endl;
+            cerr << "[Task" << taskId << "]Fail init Ошибка инициализации" << endl;
             return false;
         }
 
-
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.content);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
 
@@ -189,22 +222,19 @@ bool DowloadFunc(const string & url, string & folderPath) {
         res = curl_easy_perform(curl);
 
         if (res != CURLE_OK) {
-            cerr << "Fail DOWNL Ошибка скачивания:" << curl_easy_strerror(res) << endl;
+            cerr << "[Task" << taskId << "]Fail DOWNL Ошибка скачивания:" << curl_easy_strerror(res) << endl;
             curl_easy_cleanup(curl);
             return false;
         }
 
-        long response_code;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.responseCode);
         curl_easy_cleanup(curl);
 
-        if (response_code != 200) {
-            cerr << "Fail HTTP Ошибка HTTP ответа" << response_code << endl;
+        if (response.responseCode != 200) {
+            cerr << "[Task" << taskId << "]Fail HTTP Ошибка HTTP ответа" << response.responseCode << "для URL" << url << endl;
             curl_easy_cleanup(curl);
             return false;
         }
-
-
 
         string filename;
 
@@ -231,20 +261,30 @@ bool DowloadFunc(const string & url, string & folderPath) {
 
         file.write(response.content.c_str(), response.content.size());
         file.close();
-        cout << "Success Download Файл успешно скачан: " << fullPath << endl;
+        cout << "[Задача " << taskId << "]Success Download Файл успешно скачан: " << fullPath << endl;
         return true;
     }
 
-    //if (curl) {
-    //    FILE* fp = nullptr;
-    //    errno_t err = fopen_s(&fp, filename.c_str(), "wb");
 
-    //    if (err != 0 || fp == nullptr) {
-    //        cout << "Не удалось открыть файл для записи" << endl;
-    //        curl_easy_cleanup(curl);
-    //        return 1;
-    //    }
-    // }
+void WorkerThread() {
+    activeThreads++;
+
+    while (true) {
+        DownloadTask;
+
+        {
+            unique_lock<std::mutex> lock(queueMutex);
+        }
+
+    }
+
+
+
+
+}
+
+
+
 int main() {
         curl_global_init(CURL_GLOBAL_DEFAULT);
         string url, folderPath;
