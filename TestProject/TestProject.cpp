@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <fstream>
+#include <sstream>
 #include <filesystem>
 #include <curl/curl.h>
 #include <regex>
@@ -17,7 +18,7 @@ using namespace std;
 struct ResponseData {
     string content;
     string contentDisposition;
-    long responseCode;
+    long responseCode = 0;
 };
 
 struct DownloadTask {
@@ -26,14 +27,55 @@ struct DownloadTask {
     int taskId;
 };
 
-queue<DownloadTask> taskQueue;
-mutex queueMutex;
-condition_variable condition;
-atomic<bool> stopThreads{ false };
+class TaskQueue {
+private:
+    queue<DownloadTask> queue;
+    mutex mutex;
+    condition_variable condition;
+    atomic<bool> stop{ false };
+
+public:
+    void push(const DownloadTask& task) {
+        lock_guard<std::mutex> lock(mutex);
+        queue.push(task);
+        condition.notify_one();
+    }
+
+    bool pop(DownloadTask& task) {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [this] {
+            return stop || !queue.empty();
+            });
+
+        if (stop && queue.empty()) {
+            return false;
+        }
+
+        if (!queue.empty()) {
+            task = queue.front();
+            queue.pop();
+            return true;
+        }
+
+        return false;
+    }
+
+    void stopQueue() {
+        lock_guard<std::mutex> lock(mutex);
+        stop = true;
+        condition.notify_all();
+    }
+
+    bool empty() const {
+        lock_guard<mutex> lock(mutex);
+        return queue.empty();
+    }
+};
+
 atomic<int> activeThreads{ 0 };
 atomic<int> completedTasks{ 0 };
 atomic<int> failedTasks{ 0 };
-
+atomic<int> totalTasks{ 0 };
 
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, string* data) {
     size_t total_size = size * nmemb;
@@ -50,9 +92,6 @@ size_t HeaderCallback(void* contents, size_t size, size_t nmemb, ResponseData* r
     }
     return total_size;
 }
-
-
-
 
 
 string ExtractFileName(const string& contentDisposition) {
@@ -198,14 +237,14 @@ string UniqueFileName(const filesystem::path& directory, const string& filename)
     }
 }
 
-bool DowloadFunc(const string & url, string & folderPath, int taskId) {
+bool DowloadFunc(const string & url, string & directoryPath, int taskId) {
         CURL* curl;
         CURLcode res;
         ResponseData response;
 
         curl = curl_easy_init();
         if (!curl) {
-            cerr << "[Task" << taskId << "]Fail init Ошибка инициализации" << endl;
+            cerr << "[Task" << taskId << "]Ошибка инициализации" << endl;
             return false;
         }
 
@@ -222,7 +261,7 @@ bool DowloadFunc(const string & url, string & folderPath, int taskId) {
         res = curl_easy_perform(curl);
 
         if (res != CURLE_OK) {
-            cerr << "[Task" << taskId << "]Fail DOWNL Ошибка скачивания:" << curl_easy_strerror(res) << endl;
+            cerr << "[Task" << taskId << "]Ошибка скачивания:" << curl_easy_strerror(res) << endl;
             curl_easy_cleanup(curl);
             return false;
         }
@@ -231,7 +270,7 @@ bool DowloadFunc(const string & url, string & folderPath, int taskId) {
         curl_easy_cleanup(curl);
 
         if (response.responseCode != 200) {
-            cerr << "[Task" << taskId << "]Fail HTTP Ошибка HTTP ответа" << response.responseCode << "для URL" << url << endl;
+            cerr << "[Task" << taskId << "]Ошибка HTTP ответа" << response.responseCode << "для URL" << url << endl;
             curl_easy_cleanup(curl);
             return false;
         }
@@ -248,81 +287,188 @@ bool DowloadFunc(const string & url, string & folderPath, int taskId) {
 
         filename = ReplaceUnvalidName(filename);
 
-        filesystem::path dirpath(folderPath);
+        filesystem::path dirpath(directoryPath);
         filesystem::create_directories(dirpath);
 
         string fullPath = UniqueFileName(dirpath, filename);
 
         ofstream file(fullPath, ios::binary);
         if (!file.is_open()) {
-            cerr << "Fail file Ошибка создания файла: " << fullPath << endl;
+            cerr << "Ошибка создания файла: " << fullPath << endl;
             return false;
         }
 
         file.write(response.content.c_str(), response.content.size());
         file.close();
-        cout << "[Задача " << taskId << "]Success Download Файл успешно скачан: " << fullPath << endl;
+        cout << "[Задача " << taskId << "]Файл успешно скачан: " << fullPath << endl;
         return true;
     }
 
 
-void WorkerThread() {
+void WorkerThread(TaskQueue& taskQueue) {
     activeThreads++;
 
-    while (true) {
-        DownloadTask;
+    try {
+        DownloadTask task;
+        while (taskQueue.pop(task)) {
+            // Выполняем загрузку
+            if (DownloadSingleFile(task.url, task.directoryPath, task.taskId)) {
+                completedTasks++;
+            }
+            else {
+                failedTasks++;
+            }
 
-        {
-            unique_lock<std::mutex> lock(queueMutex);
+            // Выводим прогресс каждые 10 задач или на последней задаче
+            int processed = completedTasks + failedTasks;
+            if (processed % 10 == 0 || processed == totalTasks) {
+                std::cout << "[Прогресс] Обработано: " << processed << " / " << totalTasks
+                    << " (" << (processed * 100 / totalTasks) << "%)" << std::endl;
+            }
         }
-
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Ошибка в рабочем потоке: " << e.what() << std::endl;
     }
 
+    activeThreads--;
+}
 
+void AddQueue(const string& url, const string& directoryPath, int taskId) {
+    DownloadTask task{ url, directoryPath, taskId };
+    lock_guard<mutex> lock(queueMutex);
+    taskQueue.push(task);
+    condition.notify_one();
+}
 
+vector<string> ReadUrlsFromFile(const string& filename) {
+    vector<string> urls;
+    ifstream file(filename, ios::binary);
 
+    if (!file.is_open()) {
+        throw runtime_error("Не удалось открыть файл: " + filename);
+    }
+
+    string line;
+    while (getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        if (!line.empty()) {
+            urls.push_back(line);
+        }
+    }
+
+    return urls;
 }
 
 
 
+
+
 int main() {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        string url, folderPath;
+    SetConsoleCP(1251);
+    SetConsoleOutputCP(1251);
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    string url, directoryPath, threadCountStr;
+    int threadCount;
 
-        cout << "Введите URL файла:";
-        getline(cin, url);
+    cout << "Введите URL файла:";
+    getline(cin, url);
 
-        cout << "Укажите путь для сохранения:";
-        getline(cin, folderPath);
+    cout << "Укажите путь для сохранения:";
+    getline(cin, directoryPath);
 
-        if (url.empty() || folderPath.empty()) {
-            cerr << "Ошибка: URL и путь не могут быть пустыми" << endl;
+    cout << "Enter number of loads 1-999:";
+    getline(cin, threadCountStr);
+
+
+    if (url.empty() || directoryPath.empty() || threadCountStr.empty()) {
+        cerr << "Ошибка: Параметры должные быть заполнены" << endl;
+        curl_global_cleanup();
+        return 1;
+    }
+
+    try {
+        threadCount = stoi(threadCountStr);
+        if (threadCount < 1 || threadCount > 999) {
+            cerr << "Ошибка: количество загрузок должно бьть от 1 до 999" << endl;
             curl_global_cleanup();
             return 1;
         }
+    }
+    catch (const exception& e) {
+        cerr << "Ошибка: неверный формат чисел" << endl;
+        curl_global_cleanup();
+        return 1;
+    }
 
-        cout << "Скачивание файла..." << endl;
-        cout << "URL: " << url << endl;
-        cout << "Путь: " << folderPath << endl;
+    vector<string> urls;
 
-
-        if (DowloadFunc(url, folderPath)) {
-            cout << "Sucсess Файл успешное скачан" << endl;
-        } else {
-            cerr << "Fail Ошибка скачивания файла" << endl;
+    try {
+        urls = ReadUrlsFromFile(url);
+        if (urls.empty()) {
+            cerr << "Ошибка: файл не содержит URL или пуст" << endl;
             curl_global_cleanup();
             return 1;
         }
+    }
+    catch (const exception& e) {
+        cerr << "Ошибка чтения file" << e.what() << endl;
+        curl_global_cleanup();
+        return 1;
+    }
 
+    cout << "\n=== Начало загрузки ===" << endl;
+    cout << "Файл с URL: " << url << endl;
+    cout << "Директория для сохранения: " << directoryPath << endl;
+    cout << "Количество одновременных загрузок: " << threadCount << endl;
+    cout << "Всего URL для загрузки: " << urls.size() << endl;
+    cout << "========================\n" << endl;
+
+
+
+    vector<thread> workers;
+    for (int i = 0; i < threadCount; ++i) {
+        workers.emplace_back(WorkerThread);
+    }
+
+    totalTasks = urls.size();
+    for (size_t i = 0; i < urls.size(); ++i){
+        AddQueue(urls[i], directoryPath, i + 1);
+     }
+    {
+        unique_lock<mutex> lock(queueMutex);
+        condition.wait(lock, [] {
+            return taskQueue.empty() && activeThreads == 0;
+            });
+    }
+
+        stopThreads = true;
+        condition.notify_all();
+
+        for (auto& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+
+        cout << "\n=== Статус загрузки ===" << endl;
+        cout << "Всего URL в файле: " << totalTasks << endl;
+        cout << "Успешно загружено:" << completedTasks << "файлов" << endl;
+        cout << "Не удалось загрузить:" << failedTasks << "файлов" << endl;
+        cout << "Всего задач:" <<(completedTasks + failedTasks) << endl;
+    
         curl_global_cleanup();
 
         return 0;
 
-        // if (url.empty() || folderPath.empty()) {
+        // if (url.empty() || directoryPath.empty()) {
         //     cerr << "URL и путь не должны быть пустыми" << endl;
         //     return 1;
         // }
-        /////* if (DowloadFunc(url, folderPath)) {
+        /////* if (DowloadFunc(url, directoryPath)) {
         ////      cout << "Файл успешно скачан!" << std:endl;
         //// }
         //// else {
