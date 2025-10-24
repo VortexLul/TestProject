@@ -101,23 +101,24 @@ string ExtractFileName(const string& contentDisposition) {
         (contentDisposition[filename_pos] == ' ' || contentDisposition[filename_pos] == '\t')) {
         filename_pos++;
     }
+    if (filename_pos >= contentDisposition.size()) return "";
 
     string filename;
+    size_t end_pos = contentDisposition.size();
     
-    if (filename_pos < contentDisposition.length() &&
-        (contentDisposition[filename_pos] == '\"' || contentDisposition[filename_pos] == '\'')) {
+    if (contentDisposition[filename_pos] == '\"' || contentDisposition[filename_pos] == '\'') {
+        char quote = contentDisposition[filename_pos];
         filename_pos++;
-        size_t end_quote = contentDisposition.find(contentDisposition[filename_pos - 1], filename_pos);
-        if (end_quote != std::string::npos) {
+        size_t end_quote = contentDisposition.find(quote, filename_pos);
+        if (end_quote != string::npos) {
             filename = contentDisposition.substr(filename_pos, end_quote - filename_pos);
         }
     }
     else {
-        size_t end_pos = contentDisposition.length();
-        for (size_t i = filename_pos; i < contentDisposition.length(); i++) {
-            if (contentDisposition[i] == ';' || contentDisposition[i] == '\r' ||
-                contentDisposition[i] == '\n' || contentDisposition[i] == ' ' ||
-                contentDisposition[i] == '\t') {
+  
+        for (size_t i = filename_pos; i < contentDisposition.size(); i++) {
+            char c = contentDisposition[i];
+            if (c == ';' || c == '\r' || c == '\n' || c == ' ' || c == '\t') {
                 end_pos = i;
                 break;
             }
@@ -132,6 +133,9 @@ string ExtractFileName(const string& contentDisposition) {
         size_t end = filename.find_last_not_of(" \t\r\n");
         if (start != string::npos && end != string::npos) {
             filename = filename.substr(start, end - start + 1);
+        }
+        else {
+            filename.clear();
         }
     }
     return filename;
@@ -195,77 +199,86 @@ string UniqueFileName(const filesystem::path& directory, const string& filename)
     if (!filesystem::exists(basePath)) {
         return basePath.string();
     }
-
     string stem = basePath.stem().string();
     string extension = basePath.extension().string();
 
-    if (extension.empty()) {
-        int counter = 1;
-        while (true) {
-            filesystem::path newPath = directory / (stem + " (" + to_string(counter) + ")");
-            if (!filesystem::exists(newPath)) {
-                return newPath.string();
-            }
-            counter++;
+    for (int counter = 1; counter < 1000; ++counter) {
+        filesystem::path new_path;
+        if (extension.empty()) {
+            new_path = directory / (stem + " (" + to_string(counter) + ")");
         }
+        else {
+            new_path = directory / (stem + " (" + to_string(counter) + ")" + extension);
+        }
+
+        if (!filesystem::exists(new_path)) {
+            return new_path.string();
+        }
+    }
+
+    auto now = chrono::system_clock::now();
+    auto timestamp = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()).count();
+
+    if (extension.empty()) {
+        return (directory / (stem + "_" + to_string(timestamp))).string();
     }
     else {
-        
-        int counter = 1;
-        while (true) {
-            filesystem::path newPath = directory / (stem + " (" + to_string(counter) + ")" + extension);
-            if (!filesystem::exists(newPath)) {
-                return newPath.string();
-            }
-            counter++;
-        }
+        return (directory / (stem + "_" + to_string(timestamp) + extension)).string();
     }
+
 }
 
-bool DowloadFunc(const string & url, string & directoryPath, int taskId) {
-        CURL* curl = curl_easy_init;
-        
-
+bool DowloadFunc(const string& url, string& directoryPath, int taskId) {
+        CURL* curl = curl_easy_init();
+       
         if (!curl) {
             cerr << "[Task" << taskId << "]Ошибка инициализации" << endl;
             return false;
         }
 
+       
+        struct CurlGuard {
+            CURL* curl;
+            CurlGuard(CURL* c) : curl(c) {}
+            ~CurlGuard() { if (curl) curl_easy_cleanup(curl); }
+        } curl_guard(curl);
+
         ResponseData response;
         CURLcode res;
-
-        struct CurlGuard {
-
-        };
 
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.content);
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+     
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
 
 
         res = curl_easy_perform(curl);
 
         if (res != CURLE_OK) {
             cerr << "[Task" << taskId << "]Ошибка скачивания:" << curl_easy_strerror(res) << endl;
-            curl_easy_cleanup(curl);
+ 
             return false;
         }
 
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.responseCode);
-        curl_easy_cleanup(curl);
+     
 
         if (response.responseCode != 200) {
-            cerr << "[Task" << taskId << "]Ошибка HTTP ответа" << response.responseCode << "для URL" << url << endl;
+            cerr << "[Task" << taskId << "]Ошибка HTTP ответа" << response.responseCode << endl;
             return false;
         }
-
+        if (response.content.empty()) {
+            cerr << "[Task " << taskId << "] Empty response content" << endl;
+            return false;
+        }
+      
         string filename;
-
         if (!response.contentDisposition.empty()) {
             filename = ExtractFileName(response.contentDisposition);
         }
@@ -277,12 +290,12 @@ bool DowloadFunc(const string & url, string & directoryPath, int taskId) {
         filename = ReplaceUnvalidName(filename);
 
         filesystem::path dirpath(directoryPath);
-        try {
-            filesystem::create_directories(dirpath);
-        }
-        catch (const exception& e) {
-            cerr << "[Task " << taskId << "] Ошибка создания директории: " << e.what() << endl;
-            return false;
+        error_code ec;
+        if (!filesystem::exists(dirpath, ec)) {
+            if (!filesystem::create_directories(dirpath, ec)) {
+                cerr << "[Задача " << taskId << "] Не удалось создать директорию: " << ec.message() << endl;
+                return false;
+            }
         }
 
         string fullPath = UniqueFileName(dirpath, filename);
@@ -295,7 +308,14 @@ bool DowloadFunc(const string & url, string & directoryPath, int taskId) {
 
         file.write(response.content.c_str(), response.content.size());
         file.close();
-        std::cout << "[Задача " << taskId << "]Файл успешно скачан: " << fullPath << endl;
+
+        if (!file) {
+            cerr << "[Задача " << taskId << "] Ошибка записи: " << fullPath << endl;
+            return false;
+        }
+
+        cout << "[Задачи " << taskId << "] Успешно скачано: " << fullPath
+            << " (" << response.content.size() << " bytes)" << endl;
         return true;
     }
 
@@ -334,13 +354,13 @@ void WorkerThread() {
 
                 int processed = completedTasks + failedTasks;
                 if (processed % 10 == 0 || processed == totalTasks) {
-                    cout << "[Прогресс] Обработано: " << processed << "/" << totalTasks << " (" << (totalTasks > 0 ? (processed * 100 / totalTasks) : 0)<< "%)" << endl;
+                    cout << "[Прогресс] Обработано: " << processed << "/" << totalTasks << " (" << (totalTasks > 0 ? (processed * 100 / totalTasks) : 0) << "%)" << endl;
                 }
             }
         }
     }
     catch (const exception& e) {
-        cerr << "Ошибка в потоке: " << e.what() << endl;
+        cerr << "Ошибка потока: " << e.what() << endl;
         failedTasks++;
     }
 
@@ -377,7 +397,7 @@ vector<string> ReadUrlsFromFile(const string& filename) {
     }
 
     if (urls.empty()) {
-        throw runtime_error("File is empty or contains no valid URLs");
+        throw runtime_error("Файл пуст или не содержит правильный URL");
     }
 
     return urls;
@@ -401,8 +421,8 @@ int main() {
         string url, directoryPath, threadCountStr;
 
         cout << "Введите URL файла:";
-
         getline(cin, url);
+
         cout << "Укажите путь для сохранения:";
         getline(cin, directoryPath);
         
@@ -422,8 +442,8 @@ int main() {
         int threadCount;
         try {
             threadCount = stoi(threadCountStr);
-            if (threadCount < 1 || threadCount > 99) {
-                cerr << "Ошибка количество потоков должно быть от 1 до 99" << endl;
+            if (threadCount < 1 || threadCount > 16) {
+                cerr << "Ошибка количество потоков должно быть от 1 до 16" << endl;
                 return 1;
             }
         }
@@ -445,11 +465,11 @@ int main() {
                 cout << "  " << (i + 1) << ". " << urls[i] << endl;
             }
             if (urls.size() > preview_count) {
-                cout << "  ... and " << (urls.size() - preview_count) << " more" << endl;
+                cout << "  ... и " << (urls.size() - preview_count) << " more" << endl;
             }
         }
         catch (const exception& e) {
-            cerr << "Error reading URL file: " << e.what() << endl;
+            cerr << "ошибка чтения URL файла: " << e.what() << endl;
             return 1;
         }
 
