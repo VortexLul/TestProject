@@ -11,6 +11,17 @@
 #include <queue>
 #include <vector>
 #include <thread>
+#include <chrono>
+#include <iomanip>
+#include <cstring>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <locale>
+#include <codecvt>
+#endif
+
 
 using namespace std;
 
@@ -36,6 +47,18 @@ atomic<int> activeThreads{ 0 };
 atomic<int> completedTasks{ 0 };
 atomic<int> failedTasks{ 0 };
 atomic<int> totalTasks{ 0 };
+
+
+ string GetCurrentTime() {
+    auto now = chrono::system_clock::now();
+    auto time_t = chrono::system_clock::to_time_t(now);
+    auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+    stringstream ss;
+    ss << put_time(localtime(&time_t), "%H:%M:%S");
+    ss << "." << setfill('0') << setw(3) << ms.count();
+    return ss.str();
+}
 
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userdata) {
     if (!userdata || !contents || size == 0 || nmemb == 0) {
@@ -76,25 +99,10 @@ size_t HeaderCallback(void* contents, size_t size, size_t nmemb, void* userdata)
 }
 
 string ExtractFileName(const string& contentDisposition) {
-    if (contentDisposition.empty()) {
-        return "";
-    }
+    if (contentDisposition.empty()) return "";
 
     size_t filename_pos = contentDisposition.find("filename=");
-    if (filename_pos == string::npos) {
-        return "";
-
-    }
-
-    /*    filename_pos = contentDisposition.find("filename =");
-    }
-    if (filename_pos == string::npos) {
-        filename_pos = contentDisposition.find("Filename=");
-    }
-    if (filename_pos == string::npos) {
-        return "";
-    }*/
-
+    if (filename_pos == string::npos) return "";
 
     filename_pos += 9;
     while (filename_pos < contentDisposition.length() &&
@@ -232,7 +240,7 @@ bool DowloadFunc(const string& url, string& directoryPath, int taskId) {
         CURL* curl = curl_easy_init();
        
         if (!curl) {
-            cerr << "[Task" << taskId << "]Ошибка инициализации" << endl;
+            cerr << "[Task" << GetCurrentTime() << taskId << "]Ошибка инициализации" << endl;
             return false;
         }
 
@@ -257,7 +265,7 @@ bool DowloadFunc(const string& url, string& directoryPath, int taskId) {
      
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
 
-
+        cout << "[" << GetCurrentTime() << "] [Задача " << taskId << "] Начало загрузки: " << url << endl;
         res = curl_easy_perform(curl);
 
         if (res != CURLE_OK) {
@@ -270,15 +278,17 @@ bool DowloadFunc(const string& url, string& directoryPath, int taskId) {
      
 
         if (response.responseCode != 200) {
-            cerr << "[Task" << taskId << "]Ошибка HTTP ответа" << response.responseCode << endl;
+            cerr << "[" << GetCurrentTime() << "] [Task" << taskId << "]Ошибка HTTP ответа" << response.responseCode << endl;
             return false;
         }
         if (response.content.empty()) {
-            cerr << "[Task " << taskId << "] Empty response content" << endl;
+            cerr << "[" << GetCurrentTime() << "[Task " << taskId << "] Empty response content" << endl;
             return false;
         }
       
+
         string filename;
+
         if (!response.contentDisposition.empty()) {
             filename = ExtractFileName(response.contentDisposition);
         }
@@ -293,7 +303,7 @@ bool DowloadFunc(const string& url, string& directoryPath, int taskId) {
         error_code ec;
         if (!filesystem::exists(dirpath, ec)) {
             if (!filesystem::create_directories(dirpath, ec)) {
-                cerr << "[Задача " << taskId << "] Не удалось создать директорию: " << ec.message() << endl;
+                cerr << "[" << GetCurrentTime() << "[" << GetCurrentTime() << "[Задача " << taskId << "] Не удалось создать директорию: " << ec.message() << endl;
                 return false;
             }
         }
@@ -302,7 +312,7 @@ bool DowloadFunc(const string& url, string& directoryPath, int taskId) {
 
         ofstream file(fullPath, ios::binary);
         if (!file.is_open()) {
-            cerr << "Ошибка создания файла: " << fullPath << endl;
+            cerr << "[" << GetCurrentTime() << "] [Task " << taskId << "] Не удалось создать файл " << fullPath << endl;
             return false;
         }
 
@@ -310,11 +320,11 @@ bool DowloadFunc(const string& url, string& directoryPath, int taskId) {
         file.close();
 
         if (!file) {
-            cerr << "[Задача " << taskId << "] Ошибка записи: " << fullPath << endl;
+            cerr << "[" << GetCurrentTime() << "[Задача " << taskId << "] Ошибка записи: " << fullPath << endl;
             return false;
         }
 
-        cout << "[Задачи " << taskId << "] Успешно скачано: " << fullPath
+        cout << "[" << GetCurrentTime() << "[Задачи " << taskId << "] Успешно скачано: " << fullPath
             << " (" << response.content.size() << " bytes)" << endl;
         return true;
     }
@@ -323,48 +333,37 @@ bool DowloadFunc(const string& url, string& directoryPath, int taskId) {
 void WorkerThread() {
     activeThreads++;
 
-    try {
-        while (!stopThreads) {
-            DownloadTask task;
-            bool has_task = false;
-            {
-                unique_lock<mutex> lock(qMutex);
-
-                if (!taskQueue.empty() && stopThreads) {
-                    break;
-                }
-                if (taskQueue.empty()) {
-                    task = move(taskQueue.front());
-                    taskQueue.pop();
-                    has_task = true;
-                }
-                else {
-                    condition.wait(lock);
-                    continue;
-                }
+    while (true) {
+        DownloadTask task;
+        {
+            unique_lock<mutex> lock(qMutex);
+            condition.wait(lock, [] {
+                return stopThreads || !taskQueue.empty();
+                });
+            if (stopThreads && taskQueue.empty()) {
+                break;
             }
-
-            if (has_task) {
-                if (DowloadFunc(task.url, task.directoryPath, task.taskId)) {
-                    completedTasks++;
-                }
-                else {
-                    failedTasks++;
-                }
-
-                int processed = completedTasks + failedTasks;
-                if (processed % 10 == 0 || processed == totalTasks) {
-                    cout << "[Прогресс] Обработано: " << processed << "/" << totalTasks << " (" << (totalTasks > 0 ? (processed * 100 / totalTasks) : 0) << "%)" << endl;
-                }
+            if (!taskQueue.empty()){
+                task = taskQueue.front();
+                taskQueue.pop();
+            }
+            else {
+                continue;
             }
         }
+        if (DowloadFunc(task.url, task.directoryPath, task.taskId)) {
+            completedTasks++;
+        }
+        else {
+            failedTasks++;
+        }
+        int processed = completedTasks + failedTasks;
+        if (processed % 10 == 0 || processed == totalTasks) {
+            cout << "[" << GetCurrentTime() << "] [Прогресс] " << processed << "/" << totalTasks << "(" << (totalTasks > 0 ? (processed * 100 / totalTasks) : 0) << "%)" << endl;
+        }
     }
-    catch (const exception& e) {
-        cerr << "Ошибка потока: " << e.what() << endl;
-        failedTasks++;
-    }
-
     activeThreads--;
+   
 }
 
 void AddQueue(const string& url, const string& directoryPath, int taskId) {
